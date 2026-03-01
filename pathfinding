@@ -1,0 +1,601 @@
+
+
+import pygame
+import heapq
+import random
+import math
+import time
+from collections import defaultdict
+
+CELL     = 32
+PAD      = 300       
+MIN_H    = 600
+FPS      = 30
+
+BG          = (245, 247, 250)
+PANEL_BG    = (255, 255, 255)
+PANEL_BORD  = (210, 215, 225)
+CELL_FREE   = (255, 255, 255)
+CELL_BORDER = (200, 205, 215)
+
+WALL_C      = (90,  100, 120)
+START_C     = (52,  199, 152)
+GOAL_C      = (255, 160,  60)
+PATH_C      = (80,  185, 100)
+VISITED_C   = (160, 195, 240)
+FRONTIER_C  = (255, 230, 100)
+AGENT_C     = (180,  80, 220)
+
+TEXT_DARK   = (40,  45,  60)
+TEXT_MED    = (90, 100, 120)
+TEXT_LIGHT  = (160, 165, 180)
+ACCENT      = (60,  120, 220)
+SUCCESS     = (40,  170,  90)
+DANGER      = (220,  60,  60)
+WARNING     = (240, 160,  30)
+
+BTN_DEFAULT = ((225, 228, 235), TEXT_DARK)
+BTN_ACTIVE  = ((60,  120, 220), (255,255,255))
+BTN_GREEN   = ((52,  199, 152), (255,255,255))
+BTN_RED     = ((220,  80,  80), (255,255,255))
+BTN_ORANGE  = ((255, 150,  50), (255,255,255))
+
+
+def manhattan(a, b):
+    return abs(a[0]-b[0]) + abs(a[1]-b[1])
+
+def euclidean(a, b):
+    return math.hypot(a[0]-b[0], a[1]-b[1])
+
+HEURISTICS = {"Manhattan": manhattan, "Euclidean": euclidean}
+
+
+def get_neighbors(node, rows, cols, walls):
+    r, c = node
+    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+        nr, nc = r+dr, c+dc
+        if 0 <= nr < rows and 0 <= nc < cols and (nr,nc) not in walls:
+            yield (nr, nc)
+
+def reconstruct(came_from, current):
+    path = []
+    while current in came_from:
+        path.append(current)
+        current = came_from[current]
+    path.append(current)
+    path.reverse()
+    return path
+
+def gbfs(start, goal, rows, cols, walls, hfunc):
+    frontier     = []
+    heapq.heappush(frontier, (hfunc(start, goal), start))
+    came_from    = {}
+    visited      = set()
+    frontier_set = {start}
+    nodes_exp    = 0
+    while frontier:
+        _, cur = heapq.heappop(frontier)
+        frontier_set.discard(cur)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        nodes_exp += 1
+        if cur == goal:
+            return reconstruct(came_from, cur), visited, nodes_exp
+        for nb in get_neighbors(cur, rows, cols, walls):
+            if nb not in visited:
+                came_from.setdefault(nb, cur)
+                if nb not in frontier_set:
+                    heapq.heappush(frontier, (hfunc(nb, goal), nb))
+                    frontier_set.add(nb)
+    return None, visited, nodes_exp
+
+def astar(start, goal, rows, cols, walls, hfunc):
+    frontier  = []
+    heapq.heappush(frontier, (hfunc(start, goal), 0, start))
+    came_from = {}
+    g_score   = defaultdict(lambda: float('inf'))
+    g_score[start] = 0
+    visited      = set()
+    frontier_set = {start}
+    nodes_exp    = 0
+    while frontier:
+        f, g, cur = heapq.heappop(frontier)
+        frontier_set.discard(cur)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        nodes_exp += 1
+        if cur == goal:
+            return reconstruct(came_from, cur), visited, nodes_exp
+        for nb in get_neighbors(cur, rows, cols, walls):
+            tg = g + 1
+            if tg < g_score[nb]:
+                g_score[nb]   = tg
+                came_from[nb] = cur
+                heapq.heappush(frontier, (tg + hfunc(nb, goal), tg, nb))
+                frontier_set.add(nb)
+    return None, visited, nodes_exp
+
+class App:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("Dynamic Pathfinding Agent")
+        self.rows      = 15
+        self.cols      = 20
+        self.walls     = set()
+        self.start     = (0, 0)
+        self.goal      = (self.rows-1, self.cols-1)
+        self.density   = 0.30
+        self.algorithm = "A*"
+        self.heuristic = "Manhattan"
+        self.dynamic_mode = False
+
+        self.path          = []
+        self.visited_nodes = set()
+        self.agent_idx     = 0
+        self.running_sim   = False
+        self.draw_mode     = "wall"
+        self.metrics       = {"nodes": 0, "cost": 0, "time_ms": 0.0, "replans": 0}
+        self.message       = "Empty grid ready. Draw walls or Gen Maze, then Run."
+        self.msg_color     = TEXT_MED
+        self.dim_input     = ""
+        self.input_active  = False
+        self._btn_rects    = {}
+
+        self.f_title  = pygame.font.SysFont("segoeui", 16, bold=True)
+        self.f_label  = pygame.font.SysFont("segoeui", 13, bold=True)
+        self.f_body   = pygame.font.SysFont("segoeui", 13)
+        self.f_metric = pygame.font.SysFont("consolas", 15, bold=True)
+        self.f_small  = pygame.font.SysFont("segoeui", 11)
+
+        self._resize()
+        # Empty grid — no maze generated on startup
+
+    
+    def _resize(self):
+        self.grid_w = self.cols * CELL
+        self.grid_h = self.rows * CELL
+        w = self.grid_w + PAD
+        h = max(self.grid_h, MIN_H)
+        self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+
+    def _handle_resize(self, new_w, new_h):
+        self.screen = pygame.display.set_mode((new_w, new_h), pygame.RESIZABLE)
+
+    
+    def generate_maze(self):
+        self.walls.clear()
+        self.path = []
+        self.visited_nodes = set()
+        self.agent_idx = 0
+        self.running_sim = False
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if (r,c) in (self.start, self.goal):
+                    continue
+                if random.random() < self.density:
+                    self.walls.add((r,c))
+
+    def clear_grid(self):
+        self.walls.clear()
+        self.path = []
+        self.visited_nodes = set()
+        self.agent_idx = 0
+        self.running_sim = False
+        self.metrics = {"nodes":0,"cost":0,"time_ms":0.0,"replans":0}
+        self.message   = "Grid cleared."
+        self.msg_color = TEXT_MED
+
+    def run_search(self, from_node=None):
+        s     = from_node if from_node else self.start
+        hfunc = HEURISTICS[self.heuristic]
+        t0    = time.perf_counter()
+        if self.algorithm == "A*":
+            path, vis, nv = astar(s, self.goal, self.rows, self.cols, self.walls, hfunc)
+        else:
+            path, vis, nv = gbfs(s, self.goal, self.rows, self.cols, self.walls, hfunc)
+        t1 = time.perf_counter()
+
+        self.visited_nodes      = vis
+        self.metrics["nodes"]   = nv
+        self.metrics["time_ms"] = round((t1-t0)*1000, 3)
+        if path:
+            self.path            = path
+            self.metrics["cost"] = len(path)-1
+            self.message   = f"{self.algorithm} ({self.heuristic})  —  Path Found!"
+            self.msg_color = SUCCESS
+            return True
+        else:
+            self.path = []
+            self.message   = "No path found! Try removing some walls."
+            self.msg_color = DANGER
+            return False
+
+   
+    def spawn_obstacle(self):
+        if random.random() > 0.08:
+            return
+        r = random.randint(0, self.rows-1)
+        c = random.randint(0, self.cols-1)
+        node = (r,c)
+        if node in (self.start, self.goal) or node in self.walls:
+            return
+        self.walls.add(node)
+        if node in self.path[self.agent_idx:]:
+            cur = self.path[self.agent_idx]
+            old = self.metrics["replans"]
+            if self.run_search(cur):
+                self.metrics["replans"] = old + 1
+                self.agent_idx = 0
+            else:
+                self.running_sim = False
+
+    def draw(self):
+        sw, sh = self.screen.get_size()
+        self.screen.fill(BG)
+        self._draw_grid(sw, sh)
+        self._draw_panel(sw, sh)
+        pygame.display.flip()
+
+    def _draw_grid(self, sw, sh):
+        path_set = set(self.path)
+        oy = max(0, (sh - self.grid_h) // 2)
+
+        for r in range(self.rows):
+            for c in range(self.cols):
+                x    = c * CELL
+                y    = oy + r * CELL
+                node = (r,c)
+
+                if node in self.walls:
+                    fill = WALL_C
+                elif node == self.start:
+                    fill = START_C
+                elif node == self.goal:
+                    fill = GOAL_C
+                elif self.running_sim and self.path and node == self.path[min(self.agent_idx, len(self.path)-1)]:
+                    fill = AGENT_C
+                elif node in path_set:
+                    fill = PATH_C
+                elif node in self.visited_nodes:
+                    fill = VISITED_C
+                else:
+                    fill = CELL_FREE
+
+                pygame.draw.rect(self.screen, fill,        (x+1,  y+1, CELL-2, CELL-2), border_radius=4)
+                pygame.draw.rect(self.screen, CELL_BORDER, (x,    y,   CELL,   CELL),   1)
+
+        
+        if self.running_sim and self.path:
+            ai = min(self.agent_idx, len(self.path)-1)
+            r, c = self.path[ai]
+            cx = c*CELL + CELL//2
+            cy = oy + r*CELL + CELL//2
+            pygame.draw.circle(self.screen, AGENT_C,       (cx, cy), CELL//2-4)
+            pygame.draw.circle(self.screen, (255,255,255), (cx, cy), CELL//2-4, 2)
+
+        pygame.draw.rect(self.screen, PANEL_BORD, (0, oy, self.grid_w, self.grid_h), 2)
+
+    def _draw_panel(self, sw, sh):
+        px = sw - PAD
+        pw = PAD
+        pygame.draw.rect(self.screen, PANEL_BG,   (px, 0, pw, sh))
+        pygame.draw.line(self.screen, PANEL_BORD, (px, 0), (px, sh), 2)
+
+        def txt(text, x, y, color=TEXT_DARK, font=None):
+            f = font or self.f_body
+            self.screen.blit(f.render(text, True, color), (x, y))
+
+        def section(label, y):
+            txt(label, px+14, y, TEXT_LIGHT, self.f_small)
+            pygame.draw.line(self.screen, PANEL_BORD, (px+14, y+14), (px+pw-14, y+14), 1)
+            return y+22
+
+        def btn(label, x, y, w=120, h=30, fill=BTN_DEFAULT[0], tcol=BTN_DEFAULT[1], radius=7):
+            rect = pygame.Rect(x, y, w, h)
+            pygame.draw.rect(self.screen, fill, rect, border_radius=radius)
+            s = self.f_body.render(label, True, tcol)
+            self.screen.blit(s, (x+(w-s.get_width())//2, y+(h-s.get_height())//2))
+            return rect
+
+        y = 14
+        txt("PATHFINDING AGENT", px+14, y, TEXT_DARK, self.f_title)
+        y += 30
+
+       
+        y = section("ALGORITHM", y)
+        a_f, a_tc = BTN_ACTIVE  if self.algorithm=="A*"   else BTN_DEFAULT
+        g_f, g_tc = BTN_ACTIVE  if self.algorithm=="GBFS" else BTN_DEFAULT
+        self._btn_rects["astar"] = btn("A*",   px+14,  y, 110, 32, a_f, a_tc)
+        self._btn_rects["gbfs"]  = btn("GBFS", px+134, y, 110, 32, g_f, g_tc)
+        y += 44
+
+        y = section("HEURISTIC", y)
+        m_f, m_tc = BTN_ACTIVE if self.heuristic=="Manhattan" else BTN_DEFAULT
+        e_f, e_tc = BTN_ACTIVE if self.heuristic=="Euclidean" else BTN_DEFAULT
+        self._btn_rects["manh"] = btn("Manhattan", px+14,  y, 120, 32, m_f, m_tc)
+        self._btn_rects["eucl"] = btn("Euclidean", px+144, y, 110, 32, e_f, e_tc)
+        y += 44
+
+        y = section("DRAW MODE", y)
+        modes = [("Wall","wall",WALL_C,(255,255,255)),
+                 ("Start","start",START_C,(255,255,255)),
+                 ("Goal","goal",GOAL_C,(255,255,255))]
+        for i,(label,key,ac,atc) in enumerate(modes):
+            active = self.draw_mode == key
+            f  = ac            if active else BTN_DEFAULT[0]
+            tc = atc           if active else TEXT_DARK
+            self._btn_rects[f"dm_{key}"] = btn(label, px+14+i*88, y, 82, 30, f, tc)
+        y += 44
+
+        y = section("GRID SIZE  (rows x cols)", y)
+        inp_rect = pygame.Rect(px+14, y, 148, 30)
+        ibg = (230,240,255) if self.input_active else (240,242,246)
+        pygame.draw.rect(self.screen, ibg,    inp_rect, border_radius=6)
+        pygame.draw.rect(self.screen, ACCENT if self.input_active else PANEL_BORD, inp_rect, 1, border_radius=6)
+        disp = self.dim_input if self.dim_input else f"{self.rows} x {self.cols}"
+        self.screen.blit(self.f_body.render(disp, True, TEXT_DARK), (px+20, y+7))
+        self._btn_rects["dim_inp"]   = inp_rect
+        self._btn_rects["apply_dim"] = btn("Apply", px+170, y, 80, 30, BTN_GREEN[0], BTN_GREEN[1])
+        y += 44
+
+        y = section(f"OBSTACLE DENSITY  —  {int(self.density*100)}%", y)
+        bar_w = pw - 28
+        pygame.draw.rect(self.screen, (220,225,235), (px+14, y, bar_w, 8), border_radius=4)
+        pygame.draw.rect(self.screen, ACCENT,        (px+14, y, int(bar_w*self.density), 8), border_radius=4)
+        y += 16
+        self._btn_rects["den_dn"] = btn("- 5%", px+14,  y, 80, 28, BTN_RED[0],   BTN_RED[1])
+        self._btn_rects["den_up"] = btn("+ 5%", px+104, y, 80, 28, BTN_GREEN[0], BTN_GREEN[1])
+        y += 42
+
+        y = section("ACTIONS", y)
+        self._btn_rects["gen"]        = btn("Gen Maze",  px+14,  y, 125, 34, (60,120,220),(255,255,255))
+        self._btn_rects["clear_grid"] = btn("Clear Grid",px+149, y, 115, 34, (200,205,215), TEXT_DARK)
+        y += 46
+        self._btn_rects["run"]   = btn("Run Search", px+14,  y, 125, 34, BTN_GREEN[0], BTN_GREEN[1])
+        self._btn_rects["clear"] = btn("Clear Path", px+149, y, 115, 34, BTN_DEFAULT[0], TEXT_DARK)
+        y += 46
+        dyn_f  = BTN_ORANGE[0] if self.dynamic_mode else BTN_DEFAULT[0]
+        dyn_tc = BTN_ORANGE[1] if self.dynamic_mode else TEXT_DARK
+        dyn_lbl = "Dynamic Mode: ON" if self.dynamic_mode else "Dynamic Mode: OFF"
+        self._btn_rects["dyn"] = btn(dyn_lbl, px+14, y, 250, 34, dyn_f, dyn_tc)
+        y += 52
+
+        y = section("METRICS", y)
+        box = pygame.Rect(px+10, y, pw-20, 120)
+        pygame.draw.rect(self.screen, (248,250,255), box, border_radius=8)
+        pygame.draw.rect(self.screen, PANEL_BORD,    box, 1, border_radius=8)
+
+        rows_data = [
+            ("Nodes Visited",  self.metrics["nodes"],    ACCENT),
+            ("Path Cost",      self.metrics["cost"],     SUCCESS),
+            ("Time (ms)",      self.metrics["time_ms"],  WARNING),
+            ("Re-plans",       self.metrics["replans"],  DANGER),
+        ]
+        my = y + 10
+        for label, val, col in rows_data:
+            # label on left
+            self.screen.blit(self.f_body.render(label, True, TEXT_MED), (px+18, my))
+            # value on right, big
+            val_s = self.f_metric.render(str(val), True, col)
+            self.screen.blit(val_s, (px+pw-18-val_s.get_width(), my-1))
+            # separator
+            pygame.draw.line(self.screen, (235,238,245),
+                             (px+14, my+18), (px+pw-14, my+18), 1)
+            my += 26
+        y += 130
+
+        y = section("LEGEND", y)
+        legend = [
+            (START_C,   "Start"),
+            (GOAL_C,    "Goal"),
+            (PATH_C,    "Path"),
+            (VISITED_C, "Visited"),
+            (WALL_C,    "Wall"),
+            (AGENT_C,   "Agent"),
+        ]
+        col1 = legend[:3]
+        col2 = legend[3:]
+        for i,(color,label) in enumerate(col1):
+            pygame.draw.rect(self.screen, color, (px+14, y+i*22, 14, 14), border_radius=3)
+            txt(label, px+34, y+i*22-1, TEXT_MED, self.f_small)
+        for i,(color,label) in enumerate(col2):
+            pygame.draw.rect(self.screen, color, (px+154, y+i*22, 14, 14), border_radius=3)
+            txt(label, px+174, y+i*22-1, TEXT_MED, self.f_small)
+        y += max(len(col1),len(col2))*22 + 10
+
+        pygame.draw.line(self.screen, PANEL_BORD, (px+10, y), (px+pw-10, y), 1)
+        y += 8
+        for line in self._wrap(self.message, 36):
+            txt(line, px+14, y, self.msg_color, self.f_small)
+            y += 16
+
+        hint_y = sh - 44
+        if hint_y > y + 10:
+            pygame.draw.line(self.screen, PANEL_BORD, (px+10, hint_y-6),(px+pw-10, hint_y-6), 1)
+            txt("R: Run   G: Gen Maze   D: Dynamic   C: Clear Path", px+14, hint_y,    TEXT_LIGHT, self.f_small)
+            txt("Left-click grid: draw wall   Drag: paint walls",     px+14, hint_y+16, TEXT_LIGHT, self.f_small)
+
+    def _wrap(self, text, width):
+        words = text.split()
+        lines, cur = [], ""
+        for w in words:
+            if len(cur)+len(w)+1 <= width:
+                cur += ("" if not cur else " ") + w
+            else:
+                if cur: lines.append(cur)
+                cur = w
+        if cur: lines.append(cur)
+        return lines
+
+    def handle_click(self, pos, button):
+        sw, sh = self.screen.get_size()
+        mx, my = pos
+        px = sw - PAD
+        oy = max(0, (sh - self.grid_h) // 2)
+
+        if mx < px and oy <= my < oy + self.grid_h:
+            c = mx // CELL
+            r = (my - oy) // CELL
+            if 0 <= r < self.rows and 0 <= c < self.cols:
+                node = (r,c)
+                if self.draw_mode == "wall":
+                    if node not in (self.start, self.goal):
+                        self.walls.discard(node) if node in self.walls else self.walls.add(node)
+                elif self.draw_mode == "start":
+                    if node not in self.walls and node != self.goal:
+                        self.start = node
+                elif self.draw_mode == "goal":
+                    if node not in self.walls and node != self.start:
+                        self.goal = node
+            return
+
+        for key, rect in self._btn_rects.items():
+            if rect.collidepoint(pos):
+                self._handle_btn(key)
+                return
+
+    def _handle_drag(self, pos):
+        sw, sh = self.screen.get_size()
+        mx, my = pos
+        px = sw - PAD
+        oy = max(0, (sh - self.grid_h) // 2)
+        if mx < px and oy <= my < oy + self.grid_h:
+            c = mx // CELL
+            r = (my - oy) // CELL
+            if 0 <= r < self.rows and 0 <= c < self.cols:
+                node = (r,c)
+                if self.draw_mode == "wall" and node not in (self.start, self.goal):
+                    self.walls.add(node)
+
+    def _handle_btn(self, key):
+        if key == "astar":
+            self.algorithm = "A*"
+        elif key == "gbfs":
+            self.algorithm = "GBFS"
+        elif key == "manh":
+            self.heuristic = "Manhattan"
+        elif key == "eucl":
+            self.heuristic = "Euclidean"
+        elif key.startswith("dm_"):
+            self.draw_mode = key[3:]
+        elif key == "gen":
+            self.generate_maze()
+            self.message   = f"Maze generated  ({int(self.density*100)}% density)."
+            self.msg_color = TEXT_MED
+        elif key == "clear_grid":
+            self.clear_grid()
+        elif key == "run":
+            self.running_sim = False
+            self.agent_idx   = 0
+            self.metrics["replans"] = 0
+            found = self.run_search()
+            if found:
+                self.running_sim = True
+        elif key == "clear":
+            self.path          = []
+            self.visited_nodes = set()
+            self.agent_idx     = 0
+            self.running_sim   = False
+            self.metrics       = {"nodes":0,"cost":0,"time_ms":0.0,"replans":0}
+            self.message       = "Path cleared."
+            self.msg_color     = TEXT_MED
+        elif key == "dyn":
+            self.dynamic_mode  = not self.dynamic_mode
+            self.message   = "Dynamic mode " + ("ON — obstacles will spawn!" if self.dynamic_mode else "OFF.")
+            self.msg_color = WARNING if self.dynamic_mode else TEXT_MED
+        elif key == "den_dn":
+            self.density = max(0.0, round(self.density-0.05, 2))
+        elif key == "den_up":
+            self.density = min(0.90, round(self.density+0.05, 2))
+        elif key == "dim_inp":
+            self.input_active = True
+        elif key == "apply_dim":
+            self.input_active = False
+            try:
+                parts = self.dim_input.lower().replace(" ","").split("x")
+                r, c  = int(parts[0]), int(parts[1])
+                if 5 <= r <= 40 and 5 <= c <= 55:
+                    self.rows, self.cols = r, c
+                    self.start = (0,0)
+                    self.goal  = (r-1, c-1)
+                    self.walls.clear()
+                    self.path  = []
+                    self.visited_nodes = set()
+                    self.agent_idx     = 0
+                    self.running_sim   = False
+                    self._resize()
+                    self.message   = f"Grid resized to {r}x{c}. Empty grid ready."
+                    self.msg_color = SUCCESS
+                else:
+                    self.message   = "Valid range: rows 5-40, cols 5-55."
+                    self.msg_color = DANGER
+            except:
+                self.message   = "Bad format — use rows x cols e.g.  15x20"
+                self.msg_color = DANGER
+            self.dim_input = ""
+
+    def run(self):
+        clock     = pygame.time.Clock()
+        dragging  = False
+        sim_timer = 0
+        SIM_DELAY = 100
+
+        while True:
+            dt = clock.tick(FPS)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); return
+
+                elif event.type == pygame.VIDEORESIZE:
+                    self._handle_resize(event.w, event.h)
+
+                elif event.type == pygame.KEYDOWN:
+                    if self.input_active:
+                        if event.key == pygame.K_RETURN:
+                            self._handle_btn("apply_dim")
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.dim_input = self.dim_input[:-1]
+                        elif event.key == pygame.K_ESCAPE:
+                            self.input_active = False
+                            self.dim_input    = ""
+                        else:
+                            if len(self.dim_input) < 10:
+                                self.dim_input += event.unicode
+                    else:
+                        if   event.key == pygame.K_r: self._handle_btn("run")
+                        elif event.key == pygame.K_g: self._handle_btn("gen")
+                        elif event.key == pygame.K_d: self._handle_btn("dyn")
+                        elif event.key == pygame.K_c: self._handle_btn("clear")
+
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    self.input_active = False
+                    dragging = True
+                    self.handle_click(event.pos, event.button)
+
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    dragging = False
+
+                elif event.type == pygame.MOUSEMOTION and dragging:
+                    self._handle_drag(event.pos)
+
+            if self.running_sim and self.path:
+                sim_timer += dt
+                if sim_timer >= SIM_DELAY:
+                    sim_timer = 0
+                    if self.dynamic_mode:
+                        self.spawn_obstacle()
+                    if self.agent_idx < len(self.path)-1:
+                        self.agent_idx += 1
+                    else:
+                        self.running_sim = False
+                        self.message   = "Goal reached!  🎉"
+                        self.msg_color = SUCCESS
+
+            self.draw()
+
+if __name__ == "__main__":
+    app = App()
+    app.run()
